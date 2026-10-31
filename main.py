@@ -25,11 +25,11 @@ from curl_cffi import requests as curl_requests
 # ============================================================
 # TELEGRAM BOT ROUTER — integrated into main.py
 # ============================================================
-BOT_TOKEN          = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN          = os.environ.get("BOT_TOKEN", "9039355214:AAEJ3cyFXzNcz7tRma5cW-xMvg-LIzM2Fgo").strip()
 SOURCE_GROUP_ID    = int(os.environ.get("SOURCE_GROUP_ID", "-1003891414952"))
-CHARGED_CHAT_ID    = int(os.environ.get("CHARGED_CHAT_ID", "0")) or SOURCE_GROUP_ID
+CHARGED_CHAT_ID    = int(os.environ.get("CHARGED_CHAT_ID", "-1003891414952")) or SOURCE_GROUP_ID
 CHARGED_THREAD_ID  = int(os.environ.get("CHARGED_THREAD_ID", "0")) or None
-APPROVED_CHAT_ID   = int(os.environ.get("APPROVED_CHAT_ID", "0")) or SOURCE_GROUP_ID
+APPROVED_CHAT_ID   = int(os.environ.get("APPROVED_CHAT_ID", "-1003891414952")) or SOURCE_GROUP_ID
 APPROVED_THREAD_ID = int(os.environ.get("APPROVED_THREAD_ID", "0")) or None
 BOT_ROUTER_ENABLED = os.environ.get("BOT_ROUTER_ENABLED", "1") == "1"
 
