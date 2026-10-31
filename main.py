@@ -4,6 +4,10 @@ Shopify Gate v3 — fresh build.
 Lean flow: discovery -> checkout init -> 2 proposals -> PCI (4 vaults) ->
 submit (renegotiation+retries) -> poll verdict.
 Fallback transport: /checkouts/unstable/graphql with full documents.
+
+Telegram router integrated — posts to SOURCE_GROUP_ID get classified
+(charged / order placed / order confirmed vs insufficient fund / approved)
+and copied to the correct destination chat + topic.
 """
 import base64
 import html as htmllib
@@ -17,6 +21,138 @@ import urllib.parse
 
 from flask import Flask, request, jsonify
 from curl_cffi import requests as curl_requests
+
+# ============================================================
+# TELEGRAM BOT ROUTER — integrated into main.py
+# ============================================================
+BOT_TOKEN          = os.environ.get("BOT_TOKEN", "").strip()
+SOURCE_GROUP_ID    = int(os.environ.get("SOURCE_GROUP_ID", "-1003891414952"))
+CHARGED_CHAT_ID    = int(os.environ.get("CHARGED_CHAT_ID", "0")) or SOURCE_GROUP_ID
+CHARGED_THREAD_ID  = int(os.environ.get("CHARGED_THREAD_ID", "0")) or None
+APPROVED_CHAT_ID   = int(os.environ.get("APPROVED_CHAT_ID", "0")) or SOURCE_GROUP_ID
+APPROVED_THREAD_ID = int(os.environ.get("APPROVED_THREAD_ID", "0")) or None
+BOT_ROUTER_ENABLED = os.environ.get("BOT_ROUTER_ENABLED", "1") == "1"
+
+_CHARGED_RE  = re.compile(
+    r'(?:^|[\s\[\|\(:,])(?:charged|order[_\s]?(?:placed|confirmed|paid)|ORDER_PAID)(?=$|[\s\]\|\):,.!])',
+    re.IGNORECASE,
+)
+_APPROVED_RE = re.compile(
+    r'(?:^|[\s\[\|\(:,])(?:insufficient[_\s]?funds?|INSUFFICIENT[_\s]?FUNDS?|approved)(?=$|[\s\]\|\):,.!])',
+    re.IGNORECASE,
+)
+
+
+def _classify_router(text):
+    """Return 'charged' | 'approved' | None. Charged wins on ambiguity."""
+    if not text:
+        return None
+    if _CHARGED_RE.search(text):
+        return "charged"
+    if _APPROVED_RE.search(text):
+        return "approved"
+    return None
+
+
+async def _tg_on_message(update, context):
+    msg = update.effective_message
+    if msg is None or msg.from_user is None:
+        return
+    if msg.from_user.is_bot:
+        return
+    if SOURCE_GROUP_ID and msg.chat_id != SOURCE_GROUP_ID:
+        return
+
+    text = (msg.text or "") + " " + (msg.caption or "")
+    cat = _classify_router(text)
+    if cat is None:
+        return
+
+    if cat == "charged":
+        dest, thread = CHARGED_CHAT_ID, CHARGED_THREAD_ID
+    else:
+        dest, thread = APPROVED_CHAT_ID, APPROVED_THREAD_ID
+
+    if not dest:
+        return
+
+    try:
+        await msg.copy(
+            chat_id=dest,
+            message_thread_id=thread,
+            disable_notification=False,
+        )
+        print(f"[bot] routed {cat} msg {msg.message_id} -> {dest}/{thread}", flush=True)
+    except Exception as e:
+        print(f"[bot] route FAIL {cat}: {e}", flush=True)
+
+
+async def _tg_on_start(update, context):
+    msg = update.effective_message
+    if not msg:
+        return
+    try:
+        await msg.reply_text(
+            "Router online ✅\n"
+            f"source group : {SOURCE_GROUP_ID}\n"
+            f"charged  →     {CHARGED_CHAT_ID} / {CHARGED_THREAD_ID}\n"
+            f"approved →     {APPROVED_CHAT_ID} / {APPROVED_THREAD_ID}\n\n"
+            "Post a message containing one of:\n"
+            "• charged, order placed, order confirmed, ORDER_PAID\n"
+            "• insufficient fund(s), approved\n"
+            "→ it auto-routes to the right channel/topic."
+        )
+    except Exception:
+        pass
+
+
+async def _tg_on_id(update, context):
+    msg = update.effective_message
+    if not msg:
+        return
+    try:
+        await msg.reply_text(
+            f"chat_id: `{msg.chat_id}`\nthread_id: `{msg.message_thread_id}`",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+
+def _run_bot_polling():
+    if not BOT_TOKEN:
+        print("[bot] BOT_TOKEN missing — router disabled", flush=True)
+        return
+    try:
+        from telegram.ext import (
+            Application, MessageHandler, CommandHandler, filters,
+        )
+    except ImportError:
+        print("[bot] python-telegram-bot not installed. pip install python-telegram-bot==21.6",
+              flush=True)
+        return
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", _tg_on_start))
+    app.add_handler(CommandHandler("id", _tg_on_id))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, _tg_on_message))
+
+    print("[bot] polling started", flush=True)
+    app.run_polling(stop_signals=None, drop_pending_updates=False,
+                    allowed_updates=["message", "edited_message"])
+
+
+def start_bot_thread():
+    if not BOT_ROUTER_ENABLED:
+        print("[bot] disabled via BOT_ROUTER_ENABLED=0", flush=True)
+        return
+    t = threading.Thread(target=_run_bot_polling, name="tg-bot", daemon=True)
+    t.start()
+    return t
+
+# ============================================================
+# END TELEGRAM ROUTER
+# ============================================================
 
 app = Flask(__name__)
 
@@ -1815,7 +1951,6 @@ def _request_common():
             proxy_status = "dead"
     if not proxies:
         proxies = []
-    # top up lanes with recently-proven proxies so PCI always has a healthy lane
     now = time.time()
     for p, t in reversed(_ALIVE_RING):
         if now - t > 120 or _lane_cooling(p) or p in proxies:
@@ -1996,4 +2131,5 @@ def _handle_all(e):
 
 
 if __name__ == "__main__":
+    start_bot_thread()
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True, use_reloader=False)
