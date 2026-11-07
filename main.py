@@ -28,7 +28,7 @@ PORT = int(os.environ.get("PORT", "8090"))
 # ────────────────────────────────────────────────────────────
 # TELEGRAM NOTIFIER
 # ────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9039355214:AAEJ3cyFXzNcz7tRma5cW-xMvg-LIzM2Fgo")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9075648807:AAHhJ8WWJdsj1qLeZCaLaaqBrErFwMVARH8")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "-1003891414952")
 
 
